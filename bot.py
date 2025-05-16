@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # In-memory session states
 sessions = {}
 
-# Initialize scheduler
+# Initialize scheduler (job not started until /update)
 scheduler = BackgroundScheduler()
 
 # Helper to parse datetime from format '16/5/2025, 12.49.25'
@@ -39,7 +39,7 @@ def fetch_session_list():
         resp = requests.get(BASE_URL)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
-        elems = soup.select('a.session-link')  # sesuaikan selector
+        elems = soup.select('a.session-link')  # sesuaikan selector sesuai HTML
         return [e.text.strip().split('#')[-1] for e in elems]
     except Exception as e:
         logger.error(f"Failed list fetch: {e}")
@@ -52,14 +52,15 @@ def fetch_session_detail(session_id: str) -> dict:
         resp = requests.get(url)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
-        status = soup.find(text=lambda t: t and t.startswith('Status:')).split(':',1)[1].strip()
+        status_text = soup.find(text=lambda t: t and t.startswith('Status:'))
+        status = status_text.split(':',1)[1].strip() if status_text else 'Unknown'
         overview = {}
         for row in soup.select('div.session-overview div.row'):
             label = row.find('div', class_='col-label').text.strip().strip(':')
             value = row.find('div', class_='col-value').text.strip()
             overview[label] = value
-        created = parse_dt(overview.get('Created'))
-        started = parse_dt(overview.get('Started'))
+        created = parse_dt(overview.get('Created')) if overview.get('Created') else None
+        started = parse_dt(overview.get('Started')) if overview.get('Started') else None
         ended_text = overview.get('Ended')
         ended = parse_dt(ended_text) if ended_text else None
         return {'status': status, 'created': created, 'started': started, 'ended': ended}
@@ -74,7 +75,7 @@ def notify(msg: str):
     except Exception as e:
         logger.error(f"Telegram error: {e}")
 
-# Check function for scheduler
+# Core check function
 def check_sessions():
     now = datetime.utcnow()
     ids = fetch_session_list()
@@ -96,11 +97,11 @@ def check_sessions():
                 notify(f"🚨 Session {sid} stuck >{STUCK_THRESHOLD}m ({st})")
                 sessions[sid]['last_change'] = now
 
-# Command handlers
+# Telegram command handlers
 def start(update: Update, context: CallbackContext):
     update.message.reply_text(
-        "Halo! Bot siap memantau sesi. \n"
-        f"Gunakan /update untuk mulai auto-update, /stop untuk hentikan. \n"
+        "Halo! Bot siap memantau sesi.\n"
+        f"Gunakan /update untuk mulai auto-update, /stop untuk hentikan.\n"
         f"Interval: {POLL_INTERVAL}s, Threshold stuck: {STUCK_THRESHOLD}m."
     )
 
@@ -118,11 +119,12 @@ def update_cmd(update: Update, context: CallbackContext):
 
 
 def stop_cmd(update: Update, context: CallbackContext):
-    if scheduler.running:
+    # pause the scheduled job
+    try:
         scheduler.pause_job('check_job')
         update.message.reply_text("⏸️ Auto-update dihentikan.")
-    else:
-        update.message.reply_text("⚠️ Auto-update belum berjalan.")
+    except Exception:
+        update.message.reply_text("⚠️ Gagal menghentikan auto-update atau belum berjalan.")
 
 # Main entry
 if __name__ == '__main__':
@@ -134,11 +136,12 @@ if __name__ == '__main__':
     dp.add_handler(CommandHandler('update', update_cmd))
     dp.add_handler(CommandHandler('stop', stop_cmd))
 
-    # Schedule job but do not start until /update\    scheduler.add_job(
-        id='check_job',
+    # Schedule job but do not start until /update
+    scheduler.add_job(
         func=check_sessions,
         trigger='interval',
-        seconds=POLL_INTERVAL
+        seconds=POLL_INTERVAL,
+        id='check_job'
     )
 
     updater.start_polling()
