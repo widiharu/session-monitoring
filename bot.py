@@ -1,148 +1,135 @@
-# bot.py: Telegram bot to monitor Cortensor Devnet4 sessions (HTML parsing) with commands to control auto-update
-# Requirements: python-telegram-bot, requests, APScheduler, python-dotenv, beautifulsoup4
-
 import os
-import logging
-from datetime import datetime, timedelta
 import requests
-from dotenv import load_dotenv
-from apscheduler.schedulers.background import BackgroundScheduler
-from telegram import Bot, Update
-from telegram.ext import Updater, CommandHandler, CallbackContext
+import re
+import pytz
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import datetime, timedelta
 
-# Load configuration
+# Load .env
 load_dotenv()
-BOT_TOKEN = os.getenv('TELEGRAM_TOKEN')
-CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-BASE_URL = os.getenv('CORTENSOR_API_BASE', 'https://dashboard-devnet4.cortensor.network/cognitive')
-POLL_INTERVAL = int(os.getenv('POLL_INTERVAL_SEC', '30'))  # detik
-STUCK_THRESHOLD = int(os.getenv('STUCK_THRESHOLD_MIN', '10'))  # menit
+TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+BASE_URL = "https://dashboard-devnet4.cortensor.network/cognitive/"
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-logger = logging.getLogger(__name__)
+# Scheduler
+scheduler = BackgroundScheduler(timezone=pytz.UTC)
 
-# In-memory session states
-sessions = {}
+# Global state
+last_session_id = None
+auto_update = False
 
-# Initialize scheduler (job not started until /update)
-scheduler = BackgroundScheduler()
 
-# Helper to parse datetime from format '16/5/2025, 12.49.25'
-def parse_dt(text: str) -> datetime:
-    return datetime.strptime(text.strip(), '%d/%m/%Y, %H.%M.%S')
-
-# Fetch current session IDs by scraping main page
-def fetch_session_list():
+def get_latest_session_id():
     try:
-        resp = requests.get(BASE_URL)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        elems = soup.select('a.session-link')  # sesuaikan selector sesuai HTML
-        return [e.text.strip().split('#')[-1] for e in elems]
+        r = requests.get("https://dashboard-devnet4.cortensor.network/cognitive", timeout=10)
+        soup = BeautifulSoup(r.text, "html.parser")
+        latest_link = soup.find("a", href=re.compile(r"/cognitive/\d+"))
+        if latest_link:
+            session_id = re.search(r"/cognitive/(\d+)", latest_link["href"]).group(1)
+            return session_id
     except Exception as e:
-        logger.error(f"Failed list fetch: {e}")
-        return []
+        print(f"[ERROR] Failed to fetch latest session: {e}")
+    return None
 
-# Fetch and parse detail page
-def fetch_session_detail(session_id: str) -> dict:
+
+def get_session_info(session_id):
     try:
-        url = f"{BASE_URL}/{session_id}"
-        resp = requests.get(url)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        status_text = soup.find(text=lambda t: t and t.startswith('Status:'))
-        status = status_text.split(':',1)[1].strip() if status_text else 'Unknown'
-        overview = {}
-        for row in soup.select('div.session-overview div.row'):
-            label = row.find('div', class_='col-label').text.strip().strip(':')
-            value = row.find('div', class_='col-value').text.strip()
-            overview[label] = value
-        created = parse_dt(overview.get('Created')) if overview.get('Created') else None
-        started = parse_dt(overview.get('Started')) if overview.get('Started') else None
-        ended_text = overview.get('Ended')
-        ended = parse_dt(ended_text) if ended_text else None
-        return {'status': status, 'created': created, 'started': started, 'ended': ended}
+        url = f"{BASE_URL}{session_id}"
+        r = requests.get(url, timeout=10)
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        overview = soup.find("div", class_="session-overview")
+        status_text = soup.find("h2").text.strip() if soup.find("h2") else "Unknown"
+        details = {h3.text.strip(): div.text.strip() for h3, div in zip(soup.find_all("h3"), soup.find_all("div", class_="value"))}
+        return status_text, details
     except Exception as e:
-        logger.error(f"Error detail {session_id}: {e}")
-        return {}
+        print(f"[ERROR] Failed to fetch session info: {e}")
+        return None, {}
 
-# Notification helper
-def notify(msg: str):
+
+def is_session_stuck(session_details):
     try:
-        bot.send_message(chat_id=CHAT_ID, text=msg)
+        if "Started:" in session_details:
+            start_time = datetime.strptime(session_details["Started:"], "%d/%m/%Y, %H.%M.%S")
+            if "Ended:" not in session_details:
+                return datetime.utcnow() - start_time > timedelta(minutes=10)
     except Exception as e:
-        logger.error(f"Telegram error: {e}")
-
-# Core check function
-def check_sessions():
-    now = datetime.utcnow()
-    ids = fetch_session_list()
-    for sid in ids:
-        detail = fetch_session_detail(sid)
-        if not detail or 'status' not in detail:
-            continue
-        st = detail['status']
-        state = sessions.get(sid)
-        if not state:
-            sessions[sid] = {'status': st, 'last_change': now}
-            notify(f"🔔 New session {sid}: {st}")
-        elif st != state['status']:
-            notify(f"🔄 Session {sid} status: {state['status']} → {st}")
-            sessions[sid] = {'status': st, 'last_change': now}
-        else:
-            elapsed = now - state['last_change']
-            if elapsed > timedelta(minutes=STUCK_THRESHOLD):
-                notify(f"🚨 Session {sid} stuck >{STUCK_THRESHOLD}m ({st})")
-                sessions[sid]['last_change'] = now
-
-# Telegram command handlers
-def start(update: Update, context: CallbackContext):
-    update.message.reply_text(
-        "Halo! Bot siap memantau sesi.\n"
-        f"Gunakan /update untuk mulai auto-update, /stop untuk hentikan.\n"
-        f"Interval: {POLL_INTERVAL}s, Threshold stuck: {STUCK_THRESHOLD}m."
-    )
-
-def check_cmd(update: Update, context: CallbackContext):
-    update.message.reply_text("Menjalankan pengecekan manual...")
-    check_sessions()
-    update.message.reply_text("Pengecekan selesai.")
-
-def update_cmd(update: Update, context: CallbackContext):
-    if not scheduler.running:
-        scheduler.start()
-        update.message.reply_text("✅ Auto-update dimulai.")
-    else:
-        update.message.reply_text("⚠️ Auto-update sudah berjalan.")
+        print(f"[ERROR] Failed to parse session time: {e}")
+    return False
 
 
-def stop_cmd(update: Update, context: CallbackContext):
-    # pause the scheduled job
+async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global last_session_id
+
+    session_id = get_latest_session_id()
+    if not session_id:
+        await update.message.reply_text("Gagal mengambil session ID.")
+        return
+
+    last_session_id = session_id
+    status, details = get_session_info(session_id)
+
+    msg = f"Session #{session_id}\nStatus: {status}\n"
+    for key, value in details.items():
+        msg += f"{key} {value}\n"
+
+    if is_session_stuck(details):
+        msg += "\n⚠️ Session terdeteksi STUCK (lebih dari 10 menit belum selesai)."
+
+    await update.message.reply_text(msg)
+
+
+async def start_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global auto_update
+
+    if auto_update:
+        await update.message.reply_text("Auto update sudah berjalan.")
+        return
+
+    def job():
+        session_id = get_latest_session_id()
+        if not session_id:
+            return
+        status, details = get_session_info(session_id)
+        message = f"[Auto Update]\nSession #{session_id}\nStatus: {status}\n"
+        for key, value in details.items():
+            message += f"{key} {value}\n"
+        if is_session_stuck(details):
+            message += "\n⚠️ Session terdeteksi STUCK (lebih dari 10 menit belum selesai)."
+        requests.get(f"https://api.telegram.org/bot{TOKEN}/sendMessage", params={
+            "chat_id": CHAT_ID,
+            "text": message
+        })
+
+    scheduler.add_job(job, 'interval', seconds=30, id='check_job')
+    scheduler.start()
+    auto_update = True
+    await update.message.reply_text("Auto update aktif setiap 30 detik.")
+
+
+async def stop_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global auto_update
+
     try:
-        scheduler.pause_job('check_job')
-        update.message.reply_text("⏸️ Auto-update dihentikan.")
+        scheduler.remove_job('check_job')
+        auto_update = False
+        await update.message.reply_text("Auto update dihentikan.")
     except Exception:
-        update.message.reply_text("⚠️ Gagal menghentikan auto-update atau belum berjalan.")
+        await update.message.reply_text("Tidak ada auto update yang berjalan.")
 
-# Main entry
-if __name__ == '__main__':
-    bot = Bot(BOT_TOKEN)
-    updater = Updater(token=BOT_TOKEN)
-    dp = updater.dispatcher
-    dp.add_handler(CommandHandler('start', start))
-    dp.add_handler(CommandHandler('check', check_cmd))
-    dp.add_handler(CommandHandler('update', update_cmd))
-    dp.add_handler(CommandHandler('stop', stop_cmd))
 
-    # Schedule job but do not start until /update
-    scheduler.add_job(
-        func=check_sessions,
-        trigger='interval',
-        seconds=POLL_INTERVAL,
-        id='check_job'
-    )
+def main():
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("check", check))
+    app.add_handler(CommandHandler("update", start_auto))
+    app.add_handler(CommandHandler("stop", stop_auto))
+    print("Bot is running...")
+    app.run_polling()
 
-    updater.start_polling()
-    updater.idle()
+
+if __name__ == "__main__":
+    main()
