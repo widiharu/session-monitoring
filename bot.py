@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import os
 import re
-import time
 import logging
 import requests
 from datetime import datetime, timedelta
@@ -35,20 +34,26 @@ def parse_dt(s: str) -> datetime:
     """Parse '16/5/2025, 12.49.25' → datetime"""
     return datetime.strptime(s.strip(), "%d/%m/%Y, %H.%M.%S")
 
+
 def get_latest_session_id() -> str | None:
     """Ambil session ID terbaru dari halaman utama."""
     try:
         r = requests.get(BASE_URL, timeout=10)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
-        a = soup.find("a", href=re.compile(r"/cognitive/\d+"))
-        if not a: 
+        links = soup.find_all("a", href=re.compile(r"^/cognitive/\d+$"))
+        ids = []
+        for a in links:
+            m = re.match(r"/cognitive/(\d+)", a["href"])
+            if m:
+                ids.append(int(m.group(1)))
+        if not ids:
             return None
-        m = re.search(r"/cognitive/(\d+)", a["href"])
-        return m.group(1) if m else None
+        return str(max(ids))
     except Exception as e:
         logger.error(f"Error fetching latest session ID: {e}")
         return None
+
 
 def get_session_data(session_id: str) -> dict:
     """Scrape detail sesi: status + overview."""
@@ -59,7 +64,7 @@ def get_session_data(session_id: str) -> dict:
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
 
-        # Status (misal di <h2>)
+        # Status
         h2 = soup.find("h2")
         if h2:
             data["status"] = h2.text.strip()
@@ -69,29 +74,36 @@ def get_session_data(session_id: str) -> dict:
         if overview_div:
             rows = overview_div.find_all("div", class_="row")
             for row in rows:
-                label = row.find("div", class_="col-label").text.strip().rstrip(":")
-                value = row.find("div", class_="col-value").text.strip()
-                data[label] = value
+                label_div = row.find("div", class_="col-label")
+                value_div = row.find("div", class_="col-value")
+                if label_div and value_div:
+                    label = label_div.text.strip().rstrip(":")
+                    value = value_div.text.strip()
+                    data[label] = value
     except Exception as e:
         logger.error(f"Error fetching session {session_id}: {e}")
     return data
 
+
 def format_message(data: dict) -> str:
     """Bentuk teks pesan Telegram dari data scraping."""
     lines = [f"Session #{data['id']}", f"Status: {data.get('status','')}\n"]
-    for k,v in data.items():
-        if k in ("id","status"): continue
+    for k, v in data.items():
+        if k in ("id", "status"): continue
         lines.append(f"{k}: {v}")
     # cek stuck
     if "Started" in data and "Ended" not in data:
-        start_dt = parse_dt(data["Started"])
-        if datetime.utcnow() - start_dt > timedelta(minutes=STUCK_MIN):
-            lines.append("\n⚠️ Session STUCK lebih dari 10 menit!")
+        try:
+            start_dt = parse_dt(data["Started"])
+            if datetime.utcnow() - start_dt > timedelta(minutes=STUCK_MIN):
+                lines.append("\n⚠️ Session STUCK lebih dari {STUCK_MIN} menit!")
+        except:
+            pass
     return "\n".join(lines)
 
 # ─── Bot Handlers ─────────────────────────────────────────────────────────────
 async def check_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/check – scrape sekali dan kirim hasil."""
+    """ /check – scrape sekali dan kirim hasil. """
     await update.message.reply_text("🔍 Mengambil session terbaru…")
     sid = get_latest_session_id()
     if not sid:
@@ -107,23 +119,22 @@ async def auto_job():
         return
     data = get_session_data(sid)
     text = "[Auto Update]\n" + format_message(data)
-    # kirim
     requests.get(
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
         params={"chat_id": CHAT_ID, "text": text}
     )
 
 async def update_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/update – start auto-scrape"""
+    """ /update – start auto-scrape """
     if scheduler.get_job("auto_job"):
         await update.message.reply_text("⚠️ Auto-update sudah berjalan.")
     else:
         scheduler.add_job(auto_job, "interval", seconds=INTERVAL_SEC, id="auto_job")
         scheduler.start()
-        await update.message.reply_text(f"✅ Auto-update tiap {INTERVAL_SEC} detik.")
+        await update.message.reply_text(f"✅ Auto-update tiap {INTERVAL_SEC} detik aktif.")
 
 async def stop_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/stop – stop auto-scrape"""
+    """ /stop – stop auto-scrape """
     if scheduler.get_job("auto_job"):
         scheduler.remove_job("auto_job")
         await update.message.reply_text("⏸️ Auto-update dihentikan.")
