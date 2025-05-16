@@ -1,135 +1,147 @@
+#!/usr/bin/env python3
 import os
-import requests
+import asyncio
 import re
-import pytz
-from bs4 import BeautifulSoup
-from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from apscheduler.schedulers.background import BackgroundScheduler
+import logging
 from datetime import datetime, timedelta
 
-# Load .env
+from dotenv import load_dotenv
+from playwright.async_api import async_playwright
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import pytz
+
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+)
+
+# ─── Config ───────────────────────────────────────────────────────────────────
 load_dotenv()
-TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-BASE_URL = "https://dashboard-devnet4.cortensor.network/cognitive/"
+BOT_TOKEN    = os.getenv("BOT_TOKEN")
+CHAT_ID      = os.getenv("CHAT_ID")
+BASE_URL     = os.getenv("BASE_URL", "https://dashboard-devnet4.cortensor.network/cognitive")
+INTERVAL_SEC = int(os.getenv("INTERVAL_AUTO_SEC", "240"))  # default 240s = 4 menit
+STUCK_MIN    = int(os.getenv("STUCK_THRESHOLD_MIN", "10")) # 10 menit
 
-# Scheduler
-scheduler = BackgroundScheduler(timezone=pytz.UTC)
+if not (BOT_TOKEN and CHAT_ID):
+    print("❌ BOT_TOKEN dan CHAT_ID harus di-.env!")
+    exit(1)
 
-# Global state
-last_session_id = None
-auto_update = False
+# ─── Logging ──────────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
+# ─── Scheduler ────────────────────────────────────────────────────────────────
+scheduler = AsyncIOScheduler(timezone=pytz.UTC)
 
-def get_latest_session_id():
-    try:
-        r = requests.get("https://dashboard-devnet4.cortensor.network/cognitive", timeout=10)
-        soup = BeautifulSoup(r.text, "html.parser")
-        latest_link = soup.find("a", href=re.compile(r"/cognitive/\d+"))
-        if latest_link:
-            session_id = re.search(r"/cognitive/(\d+)", latest_link["href"]).group(1)
-            return session_id
-    except Exception as e:
-        print(f"[ERROR] Failed to fetch latest session: {e}")
-    return None
+# ─── Scraper Helpers ──────────────────────────────────────────────────────────
+def parse_dt(s: str) -> datetime:
+    """Parse '16/5/2025, 12.49.25' → datetime"""
+    return datetime.strptime(s.strip(), "%d/%m/%Y, %H.%M.%S")
 
+async def get_latest_session_id(playwright_page) -> str | None:
+    """Load main page, grab first /cognitive/<id> link."""
+    await playwright_page.goto(BASE_URL, timeout=30_000)
+    await playwright_page.wait_for_selector("a[href^='/cognitive/']")
+    href = await playwright_page.locator("a[href^='/cognitive/']").first.get_attribute("href")
+    if not href:
+        return None
+    m = re.search(r"/cognitive/(\d+)", href)
+    return m.group(1) if m else None
 
-def get_session_info(session_id):
-    try:
-        url = f"{BASE_URL}{session_id}"
-        r = requests.get(url, timeout=10)
-        soup = BeautifulSoup(r.text, "html.parser")
+async def get_session_data(session_id: str) -> dict:
+    """Scrape detail page and return dict of fields."""
+    url = f"{BASE_URL}/{session_id}"
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.goto(url, timeout=30_000)
+        # Status in <h2>
+        await page.wait_for_selector("h2")
+        status = await page.locator("h2").inner_text()
+        # Overview rows
+        rows = page.locator("div.session-overview div.row")
+        count = await rows.count()
+        data = {"id": session_id, "status": status}
+        for i in range(count):
+            label = await rows.nth(i).locator("div.col-label").inner_text()
+            value = await rows.nth(i).locator("div.col-value").inner_text()
+            data[label.strip(": ")] = value
+        await browser.close()
+        return data
 
-        overview = soup.find("div", class_="session-overview")
-        status_text = soup.find("h2").text.strip() if soup.find("h2") else "Unknown"
-        details = {h3.text.strip(): div.text.strip() for h3, div in zip(soup.find_all("h3"), soup.find_all("div", class_="value"))}
-        return status_text, details
-    except Exception as e:
-        print(f"[ERROR] Failed to fetch session info: {e}")
-        return None, {}
+def format_message(data: dict) -> str:
+    """Build Telegram message text from scraped data."""
+    lines = [f"Session #{data['id']}", f"Status: {data['status']}"]
+    for k, v in data.items():
+        if k in ("id", "status"):
+            continue
+        lines.append(f"{k}: {v}")
+    # detect stuck
+    if "Started" in data and "Ended" not in data:
+        start_dt = parse_dt(data["Started"])
+        if datetime.utcnow() - start_dt > timedelta(minutes=STUCK_MIN):
+            lines.append("\n⚠️ Session stuck >10 menit!")
+    return "\n".join(lines)
 
-
-def is_session_stuck(session_details):
-    try:
-        if "Started:" in session_details:
-            start_time = datetime.strptime(session_details["Started:"], "%d/%m/%Y, %H.%M.%S")
-            if "Ended:" not in session_details:
-                return datetime.utcnow() - start_time > timedelta(minutes=10)
-    except Exception as e:
-        print(f"[ERROR] Failed to parse session time: {e}")
-    return False
-
-
-async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global last_session_id
-
-    session_id = get_latest_session_id()
-    if not session_id:
-        await update.message.reply_text("Gagal mengambil session ID.")
-        return
-
-    last_session_id = session_id
-    status, details = get_session_info(session_id)
-
-    msg = f"Session #{session_id}\nStatus: {status}\n"
-    for key, value in details.items():
-        msg += f"{key} {value}\n"
-
-    if is_session_stuck(details):
-        msg += "\n⚠️ Session terdeteksi STUCK (lebih dari 10 menit belum selesai)."
-
+# ─── Bot Handlers ─────────────────────────────────────────────────────────────
+async def check_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/check – scrape sekali and reply"""
+    msg = "🔍 Mengambil session terbaru…"
     await update.message.reply_text(msg)
-
-
-async def start_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global auto_update
-
-    if auto_update:
-        await update.message.reply_text("Auto update sudah berjalan.")
+    # use a fresh page for each check
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        sid = await get_latest_session_id(page)
+        await browser.close()
+    if not sid:
+        await update.message.reply_text("❌ Gagal ambil session ID.")
         return
+    data = await get_session_data(sid)
+    text = format_message(data)
+    await update.message.reply_text(text)
 
-    def job():
-        session_id = get_latest_session_id()
-        if not session_id:
-            return
-        status, details = get_session_info(session_id)
-        message = f"[Auto Update]\nSession #{session_id}\nStatus: {status}\n"
-        for key, value in details.items():
-            message += f"{key} {value}\n"
-        if is_session_stuck(details):
-            message += "\n⚠️ Session terdeteksi STUCK (lebih dari 10 menit belum selesai)."
-        requests.get(f"https://api.telegram.org/bot{TOKEN}/sendMessage", params={
-            "chat_id": CHAT_ID,
-            "text": message
-        })
+async def _auto_job():
+    """Job that runs every INTERVAL_SEC sekunder."""
+    # create a single browser+page
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        sid = await get_latest_session_id(page)
+        if sid:
+            data = await get_session_data(sid)
+            text = "[Auto Update]\n" + format_message(data)
+            # send via bot instance
+            await application.bot.send_message(chat_id=CHAT_ID, text=text)
+        await browser.close()
 
-    scheduler.add_job(job, 'interval', seconds=30, id='check_job')
-    scheduler.start()
-    auto_update = True
-    await update.message.reply_text("Auto update aktif setiap 30 detik.")
+async def update_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/update – start auto-scrape"""
+    if scheduler.get_job("auto_job"):
+        await update.message.reply_text("⚠️ Auto-update sudah berjalan.")
+    else:
+        scheduler.add_job(_auto_job, "interval", seconds=INTERVAL_SEC, id="auto_job")
+        scheduler.start()
+        await update.message.reply_text(f"✅ Auto-update dimulai tiap {INTERVAL_SEC} detik.")
 
+async def stop_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/stop – stop auto-scrape"""
+    job = scheduler.get_job("auto_job")
+    if job:
+        scheduler.remove_job("auto_job")
+        await update.message.reply_text("⏸️ Auto-update dihentikan.")
+    else:
+        await update.message.reply_text("⚠️ Belum ada auto-update berjalan.")
 
-async def stop_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global auto_update
-
-    try:
-        scheduler.remove_job('check_job')
-        auto_update = False
-        await update.message.reply_text("Auto update dihentikan.")
-    except Exception:
-        await update.message.reply_text("Tidak ada auto update yang berjalan.")
-
-
-def main():
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("check", check))
-    app.add_handler(CommandHandler("update", start_auto))
-    app.add_handler(CommandHandler("stop", stop_auto))
-    print("Bot is running...")
-    app.run_polling()
-
-
+# ─── Main ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    main()
+    # build application
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("check",  check_handler))
+    application.add_handler(CommandHandler("update", update_handler))
+    application.add_handler(CommandHandler("stop",   stop_handler))
+    logger.info("🚀 Bot started. Commands: /check /update /stop")
+    application.run_polling()
