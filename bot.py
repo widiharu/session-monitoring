@@ -36,21 +36,36 @@ def parse_dt(s: str) -> datetime:
 
 
 def get_latest_session_id() -> str | None:
-    """Ambil session ID terbaru dengan regex fallback."""
+    """Ambil session ID terbaru via JSON API atau fallback regex."""
     try:
         r = requests.get(BASE_URL, timeout=10)
         r.raise_for_status()
+        # coba parse JSON
+        try:
+            data = r.json()
+            ids = []
+            if isinstance(data, dict) and 'sessions' in data:
+                for s in data['sessions']:
+                    if 'id' in s:
+                        ids.append(int(s['id']))
+            elif isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict) and 'id' in item:
+                        ids.append(int(item['id']))
+                    elif isinstance(item, (str, int)):
+                        ids.append(int(item))
+            if ids:
+                return str(max(ids))
+        except ValueError:
+            pass
+        # fallback regex
         html = r.text
-        # cari semua angka setelah '/cognitive/'
         ids = re.findall(r"/cognitive/(\d+)", html)
         if not ids:
-            # fallback: cari pattern 'Session #1234'
-            ids2 = re.findall(r"Session #(\d+)", html)
-            ids = ids2
+            ids = re.findall(r"Session #(\d+)", html)
         if not ids:
             return None
-        latest = max(map(int, ids))
-        return str(latest)
+        return str(max(map(int, ids)))
     except Exception as e:
         logger.error(f"Error fetching latest session ID: {e}")
         return None
@@ -64,26 +79,21 @@ def get_session_data(session_id: str) -> dict:
         r = requests.get(url, timeout=10)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
-
-        # Status
-        # Contoh: <h2>Status: Ended</h2> atau <h2>Ended</h2>
+        # status
         h2 = soup.find("h2")
         if h2:
             text = h2.text.strip()
-            # strip prefix 'Status:' jika ada
             data["status"] = text.replace("Status:", "").strip()
-
-        # Overview
-        overview_div = soup.find("div", class_="session-overview")
-        if overview_div:
-            rows = overview_div.find_all("div", class_="row")
+        # overview
+        ov = soup.find("div", class_="session-overview")
+        if ov:
+            rows = ov.find_all("div", class_="row")
             for row in rows:
-                label_div = row.find("div", class_="col-label")
-                value_div = row.find("div", class_="col-value")
-                if label_div and value_div:
-                    label = label_div.text.strip().rstrip(":")
-                    value = value_div.text.strip()
-                    data[label] = value
+                lbl = row.find("div", class_="col-label")
+                val = row.find("div", class_="col-value")
+                if lbl and val:
+                    key = lbl.text.strip().rstrip(":")
+                    data[key] = val.text.strip()
     except Exception as e:
         logger.error(f"Error fetching session {session_id}: {e}")
     return data
@@ -98,8 +108,8 @@ def format_message(data: dict) -> str:
     # cek stuck
     if "Started" in data and "Ended" not in data:
         try:
-            start_dt = parse_dt(data["Started"])
-            if datetime.utcnow() - start_dt > timedelta(minutes=STUCK_MIN):
+            st = parse_dt(data["Started"])
+            if datetime.utcnow() - st > timedelta(minutes=STUCK_MIN):
                 lines.append(f"\n⚠️ Session STUCK lebih dari {STUCK_MIN} menit!")
         except:
             pass
@@ -107,6 +117,7 @@ def format_message(data: dict) -> str:
 
 # ─── Bot Handlers ─────────────────────────────────────────────────────────────
 async def check_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """ /check – scrape sekali dan kirim hasil. """
     await update.message.reply_text("🔍 Mengambil session terbaru…")
     sid = get_latest_session_id()
     if not sid:
@@ -116,6 +127,7 @@ async def check_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(format_message(data))
 
 async def auto_job():
+    """Job auto-scrape tiap INTERVAL_SEC detik."""
     sid = get_latest_session_id()
     if not sid:
         return
@@ -127,6 +139,7 @@ async def auto_job():
     )
 
 async def update_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """ /update – start auto-scrape """
     if scheduler.get_job("auto_job"):
         await update.message.reply_text("⚠️ Auto-update sudah berjalan.")
     else:
@@ -135,6 +148,7 @@ async def update_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Auto-update tiap {INTERVAL_SEC} detik aktif.")
 
 async def stop_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """ /stop – stop auto-scrape """
     if scheduler.get_job("auto_job"):
         scheduler.remove_job("auto_job")
         await update.message.reply_text("⏸️ Auto-update dihentikan.")
